@@ -9,11 +9,12 @@ extern crate time;
 use byteorder::{BigEndian, ReadBytesExt};
 use flate2::{Decompress, Flush, Status};
 use libc::size_t;
-use opencl::cl::ll::{clCreateImage2D, clEnqueueReadImage, clSetKernelArg};
-use opencl::cl::{CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
+use opencl::cl::ll::{clCreateImage2D, clEnqueueReadImage, clEnqueueWriteImage, clGetDeviceInfo};
+use opencl::cl::ll::{clSetKernelArg};
+use opencl::cl::{CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_DEVICE_MAX_WORK_ITEM_SIZES, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl::cl::{CL_RGBA, CL_TRUE, CL_UNSIGNED_INT8, CLStatus};
-use opencl::cl::{cl_channel_order, cl_channel_type, cl_kernel, cl_mem};
-use opencl::hl::Kernel;
+use opencl::cl::{cl_channel_order, cl_channel_type, cl_device_id, cl_kernel, cl_mem};
+use opencl::hl::{Device, Kernel};
 use opencl::mem::CLBuffer;
 use opencl::util::{self, PreferedType};
 use std::cmp;
@@ -32,37 +33,91 @@ static IEND: [u8; 4] = [b'I', b'E', b'N', b'D'];
 static KERNEL_SOURCE: &'static str = "
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
 
-uchar4 get_prev(__global uchar4 *prevs, int x, int y, int i) {
-    return prevs[y * 3 + (x + i) % 3];
+int imod(int a, int b) {
+    int r = a % b;
+    return r < 0 ? r + b : r;
+    //return abs(r);
+}
+
+uchar4 get_prev(__local uchar4 *prevs, int x, int y, int i) {
+    int index = y * 3 + imod(i - x, 3);
+    return prevs[index];
 }
 
 uchar4 get_src_color(read_only image2d_t src, int bpp, int x, int y) {
-    return convert_uchar4(read_imageui(src, sampler, int2(x, y)));
+    return convert_uchar4(read_imageui(src, sampler, (int2)(x, y)));
 }
 
-void set_prev(__global uchar4 *prevs, int x, int y, int i, uchar4 color) {
-    prevs[y * 3 + (x + i) % 3] = color;
+void set_prev(__local uchar4 *prevs, int x, int y, int i, uchar4 color) {
+    //prevs[y * 3 + imod(i - x, 3)] = color;
+    int index = y * 3 + imod(i - x, 3);
+    //printf(\"%d writes to %d:%d\\n\", get_global_id(0), y, index);
+    prevs[index] = color;
 }
 
-void set_color(read_write image2d_t dest, int bpp, int x, int y, uchar4 color) {
-    write_imageui(dest, int2(x, y), convert_uint4(color));
+void set_color(write_only image2d_t dest, int bpp, int x, int y, uchar4 color) {
+    write_imageui(dest, (int2)(x, y), convert_uint4(color));
 }
 
-uchar4 png_none_defilter(read_write image2d_t dest,
+uchar4 png_none_defilter(write_only image2d_t dest,
                          read_only image2d_t src,
-                         __global uchar4 *prevs,
+                         __local uchar4 *prevs,
                          int width,
                          int height,
                          int bpp,
                          int x,
                          int y,
+                         int i,
                          uchar4 color) {
     return color;
 }
 
-uchar4 png_paeth_defilter(read_write image2d_t dest,
+uchar4 png_left_defilter(write_only image2d_t dest,
+                         read_only image2d_t src,
+                         __local uchar4 *prevs,
+                         int width,
+                         int height,
+                         int bpp,
+                         int x,
+                         int y,
+                         int i,
+                         uchar4 color) {
+    uchar4 a = x > 0 ? get_prev(prevs, 1, y, i) : (uchar4)(0, 0, 0, 0);
+    return a + color;
+}
+
+uchar4 png_up_defilter(write_only image2d_t dest,
+                       read_only image2d_t src,
+                       __local uchar4 *prevs,
+                       int width,
+                       int height,
+                       int bpp,
+                       int x,
+                       int y,
+                       int i,
+                       uchar4 color) {
+    uchar4 b = y > 0 ? get_prev(prevs, 1, y - 1, i) : (uchar4)(0, 0, 0, 0);
+    return b + color;
+}
+
+uchar4 png_avg_defilter(write_only image2d_t dest,
+                        read_only image2d_t src,
+                        __local uchar4 *prevs,
+                        int width,
+                        int height,
+                        int bpp,
+                        int x,
+                        int y,
+                        int i,
+                        uchar4 color) {
+    short4 a = x > 0 ? convert_short4(get_prev(prevs, 1, y, i)) : (short4)(0, 0, 0, 0);
+    short4 b = y > 0 ? convert_short4(get_prev(prevs, 1, y - 1, i)) : (short4)(0, 0, 0, 0);
+    return convert_uchar4((a + b) / (short4)(2, 2, 2, 2)) + color;
+}
+
+uchar4 png_paeth_defilter(write_only image2d_t dest,
                           read_only image2d_t src,
-                          __global uchar4 *prevs,
+                          __local uchar4 *prevs,
                           int width,
                           int height,
                           int bpp,
@@ -70,9 +125,9 @@ uchar4 png_paeth_defilter(read_write image2d_t dest,
                           int y,
                           int i,
                           uchar4 color) {
-    uchar4 a = get_prev(prevs, 1, y, i);
-    uchar4 b = y > 0 ? get_prev(prevs, 1, y - 1, i) : uchar4(0);
-    uchar4 c = y > 0 ? get_prev(prevs, 2, y - 1, i) : uchar4(0);
+    uchar4 a = x > 0 ? get_prev(prevs, 1, y, i) : (uchar4)(0, 0, 0, 0);
+    uchar4 b = y > 0 ? get_prev(prevs, 1, y - 1, i) : (uchar4)(0, 0, 0, 0);
+    uchar4 c = (x > 0 && y > 0) ? get_prev(prevs, 2, y - 1, i) : (uchar4)(0, 0, 0, 0);
     short4 sa = convert_short4(a);
     short4 sb = convert_short4(b);
     short4 sc = convert_short4(c);
@@ -80,32 +135,45 @@ uchar4 png_paeth_defilter(read_write image2d_t dest,
     ushort4 spa = abs(sp - sa);
     ushort4 spb = abs(sp - sb);
     ushort4 spc = abs(sp - sc);
-    short4 spaeth = select(sa, select(sb, sc, spb <= spc), spa <= spb & spa <= spc);
+    short4 spaeth = select(select(sc, sb, spb <= spc), sa, (spa <= spb) & (spa <= spc));
     uchar4 paeth = convert_uchar4(spaeth);
     return color + paeth;
 }
 
 __kernel void png_defilter(write_only image2d_t dest,
                            read_only image2d_t src,
-                           __global char *src_buffer,
-                           __global uchar4 *prevs,
+                           __global uchar *filters,
+                           __local uchar4 *prevs,
                            int width,
                            int height) {
     int bpp = 4;
     int y = get_global_id(0);
+    uchar filter = filters[y];
 
-    int src_stride = width * bpp + 1;
-    uchar filter = src_buffer[y * src_stride];
-
-    for (int i = 0; i < width + height * 2; i++) {
-        int x = i - y;
-        if (x >= 0 && x < width) {
-            uchar4 color = get_src_color(src, bpp, x, y);
-            color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-            set_color(dest, bpp, x, y, color);
+    for (int i = 0; i < width + 400; i++) {
+        for (int j = 0; j < 2; j++) {
+            int x = i - y;
+            uchar4 color;
+            if (y < height && x >= 0 && x < width) {
+                color = get_src_color(src, bpp, x, y);
+                if (filter == 0)
+                    color = png_none_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
+                else if (filter == 1)
+                    color = png_left_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
+                else if (filter == 2)
+                    color = png_up_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
+                else if (filter == 3)
+                    color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
+                else if (filter == 4)
+                    color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
+                set_color(dest, bpp, x, y, color);
+            } else {
+                color = (uchar4)(0, 0, 0, 0);
+            }
             set_prev(prevs, 0, y, i, color);
         }
-        barrier(CLK_GLOBAL_MEM_FENCE);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        //printf(\"--- next ---\\n\");
     }
 }
 ";
@@ -224,7 +292,7 @@ impl Image {
         let elapsed = time::precise_time_s() - before;
         println!("entropy decode: {}ms", elapsed * 1000.0);
 
-        /*try!(defilter(width,
+        /*let _pixels = try!(defilter(width,
                       height,
                       &unfiltered_data[..],
                       PreferedType::CPUPrefered,
@@ -253,9 +321,29 @@ fn defilter(width: u32,
             -> Result<Vec<u8>, ()> {
     let (device, context, queue) =
         try!(util::create_compute_context_prefer(cl_type).map_err(|_| ()));
-    let src_buffer: CLBuffer<u8> = context.create_buffer(unfiltered_data.len(),
-                                                         CL_MEM_READ_ONLY);
-    queue.write(&src_buffer, &&unfiltered_data[..], ());
+    let filter_buffer: CLBuffer<u8> = context.create_buffer(height as usize, CL_MEM_READ_ONLY);
+    let mut filter_data: Vec<u8> =
+        (0..height).map(|y| unfiltered_data[(y * ((width * BPP) + 1)) as usize]).collect();
+    queue.write(&filter_buffer, &&filter_data[..], ());
+
+    let mut plan = vec![];
+    let mut work_unit = (0, 0);
+    for (i, byte) in filter_data[..].iter().enumerate() {
+        if *byte < 2 {
+            plan.push(work_unit);
+            work_unit = (i, 0);
+            continue
+        }
+        work_unit = (work_unit.0, work_unit.1 + 1);
+    }
+    plan.push(work_unit);
+    println!("Plan:\nSetup: {}\nWavefront:",
+             plan.iter().filter(|&&(_, count)| count == 0).count());
+    for work_unit in &plan[..] {
+        if work_unit.1 != 0 {
+            println!("{} for {}", work_unit.0, work_unit.1);
+        }
+    }
 
     let mut errcode = 0;
     let mut format = cl_image_format {
@@ -267,27 +355,40 @@ fn defilter(width: u32,
     let dest_image;
     unsafe {
         src_image = clCreateImage2D(context.ctx,
-                                    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+                                    CL_MEM_READ_ONLY,
                                     format_ref as *mut _,
                                     width as u64,
                                     height as u64,
-                                    (width * BPP) as u64,
-                                    unfiltered_data.as_ptr() as *mut _,
+                                    0,
+                                    ptr::null_mut(),
                                     &mut errcode);
-        println!("errcode={}", errcode);
         assert!(errcode == CLStatus::CL_SUCCESS as i32);
         dest_image = clCreateImage2D(context.ctx,
-                                     CL_MEM_READ_WRITE,
+                                     CL_MEM_WRITE_ONLY,
                                      format_ref as *mut _,
                                      width as u64,
                                      height as u64,
-                                     (width * BPP) as u64,
+                                     0,
                                      ptr::null_mut(),
                                      &mut errcode);
         assert!(errcode == CLStatus::CL_SUCCESS as i32);
+
+        errcode = clEnqueueWriteImage(queue.cqueue,
+                                      src_image,
+                                      CL_TRUE,
+                                      [0, 0, 0].as_mut_ptr(),
+                                      [width as u64, height as u64, 1].as_mut_ptr(),
+                                      (width * BPP + 1) as u64,
+                                      0,
+                                      unfiltered_data[1..].as_ptr() as *const _ as *mut _,
+                                      0,
+                                      ptr::null(),
+                                      ptr::null_mut());
+        println!("errcode={}", errcode);
+        assert!(errcode == CLStatus::CL_SUCCESS as i32);
     }
-    let prevs_buffer: CLBuffer<u8> = context.create_buffer((height * BPP * 3) as usize,
-                                                           CL_MEM_READ_WRITE);
+    /*let prevs_buffer: CLBuffer<u8> = context.create_buffer((height * BPP * 3) as usize,
+                                                           CL_MEM_READ_WRITE);*/
 
     let program = context.create_program_from_source(KERNEL_SOURCE);
     match program.build(&device) {
@@ -301,6 +402,15 @@ fn defilter(width: u32,
     let event;
     let mut pixels: Vec<u8>;
     unsafe {
+        let mut max_workgroup_size: u64 = 0;
+        let cl_device = *(&device as *const Device as *const cl_device_id);
+        clGetDeviceInfo(cl_device,
+                        CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                        8,
+                        &mut max_workgroup_size as *mut _ as *mut _,
+                        ptr::null_mut());
+        println!("workgroup size={}", max_workgroup_size);
+
         let kernel = program.create_kernel("png_defilter");
         let dest_image_ref = &dest_image as *const _;
         let cl_kernel = *(&kernel as *const Kernel as *const cl_kernel);
@@ -313,20 +423,37 @@ fn defilter(width: u32,
                                1,
                                mem::size_of::<cl_mem>() as u64,
                                src_image_ref as *const _) == CLStatus::CL_SUCCESS as i32);
-        kernel.set_arg(2, &src_buffer);
-        kernel.set_arg(3, &prevs_buffer);
+        kernel.set_arg(2, &filter_buffer);
+        assert!(clSetKernelArg(cl_kernel,
+                               3,
+                               max_workgroup_size * 4,
+                               ptr::null()) == CLStatus::CL_SUCCESS as i32);
         kernel.set_arg(4, &width);
         kernel.set_arg(5, &height);
 
-        event = queue.enqueue_async_kernel(&kernel, (height - 1) as isize, None, ());
-        //let pixels: Vec<u8> = queue.get(&dest_image, &event);
+        let mut max_work_item_sizes: (u64, u64, u64) = (0, 0, 0);
+        let cl_device = *(&device as *const Device as *const cl_device_id);
+        clGetDeviceInfo(cl_device,
+                        CL_DEVICE_MAX_WORK_ITEM_SIZES,
+                        24,
+                        &mut max_work_item_sizes as *mut _ as *mut _,
+                        ptr::null_mut());
+        println!("work item sizes={:?}", max_work_item_sizes);
+
+        //event = queue.enqueue_kernel(&kernel, (height / 3 + 25) as isize, None, ());
+        event = queue.enqueue_kernel(
+            &kernel,
+            max_workgroup_size as isize,
+            Some(max_workgroup_size as isize),
+            ());
+        let stuff: Vec<u8> = queue.get(&filter_buffer, &event);
         pixels = iter::repeat(0).take((width * height * BPP) as usize).collect();
         let err = clEnqueueReadImage(queue.cqueue,
                                      dest_image,
                                      CL_TRUE,
                                      [0u64, 0u64, 0u64].as_mut_ptr(),
                                      [width as u64, height as u64, 1].as_mut_ptr(),
-                                     0,
+                                     (width * BPP) as u64,
                                      0,
                                      pixels.as_mut_ptr() as *mut _,
                                      1,
