@@ -11,6 +11,9 @@ time = "^0.1"
 [dependencies.opencl]
 git = "https://github.com/luqmana/rust-opencl.git"
 
+[dependencies.simd]
+git = "https://github.com/huonw/simd.git"
+
 [lib]
 name = "pngl"
 path = "lib.rs"

@@ -1,9 +1,10 @@
-#![feature(vec_push_all)]
+#![feature(asm, vec_push_all)]
 
 extern crate byteorder;
 extern crate flate2;
 extern crate libc;
 extern crate opencl;
+extern crate simd;
 extern crate time;
 
 use byteorder::{BigEndian, ReadBytesExt};
@@ -17,6 +18,7 @@ use opencl::cl::{cl_channel_order, cl_channel_type, cl_device_id, cl_kernel, cl_
 use opencl::hl::{Device, Kernel};
 use opencl::mem::CLBuffer;
 use opencl::util::{self, PreferedType};
+use simd::{i16x8, u32x4, u8x16};
 use std::cmp;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::iter;
@@ -100,45 +102,82 @@ uchar4 png_paeth_defilter(write_only image2d_t dest,
     return color + paeth;
 }
 
+uchar4 png_defilter_pixel(write_only image2d_t dest,
+                          read_only image2d_t src,
+                          __local uchar4 *prevs,
+                          int width,
+                          int height,
+                          int bpp,
+                          int x,
+                          int y,
+                          int i,
+                          uchar filter) {
+    if (y >= height || x < 0 || x >= width)
+        return (uchar4)(0, 0, 0, 0);
+
+    uchar4 color = get_src_color(src, bpp, x, y);
+    uchar4 a = get_prev(prevs, 1, y, i);
+    uchar4 b = get_prev(prevs, 1, y - 1, i);
+    uchar4 c = get_prev(prevs, 2, y - 1, i);
+    if (filter == 1)
+        color = a + color;
+    else if (filter == 2)
+        color = b + color;
+    else if (filter == 3)
+        color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
+    else if (filter == 4)
+        color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
+    set_color(dest, bpp, x, y, color);
+    return color;
+}
+
 __kernel void png_defilter(write_only image2d_t dest,
                            read_only image2d_t src,
                            __global int2 *scanlines,
                            __global int *skews,
+                           /*__global int2 *residuals,*/
                            __global uchar *filters,
                            __local uchar4 *prevs,
                            int width,
                            int height) {
     int bpp = 4;
     int index = get_global_id(0);
+    int group_id = get_group_id(0);
     int x_offset = scanlines[index][0];
-    int y = scanlines[index][1];
-    int skew = skews[get_group_id(0)];
+    int start_y = scanlines[index][1];
+    int y = start_y;
+    int skew = skews[group_id];
+    /*int residual_start = residuals[group_id][0];
+    int residual_length = residuals[group_id][1];*/
     uchar filter = filters[y];
 
     for (int i = 0; i < width + skew; i++) {
         int x = i + x_offset;
-        uchar4 color;
-        if (y < height && x >= 0 && x < width) {
-            color = get_src_color(src, bpp, x, y);
-            uchar4 a = get_prev(prevs, 1, y, i);
-            uchar4 b = get_prev(prevs, 1, y - 1, i);
-            uchar4 c = get_prev(prevs, 2, y - 1, i);
-            if (filter == 1)
-                color = a + color;
-            else if (filter == 2)
-                color = b + color;
-            else if (filter == 3)
-                color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
-            else if (filter == 4)
-                color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
-            set_color(dest, bpp, x, y, color);
-        } else {
-            color = (uchar4)(0, 0, 0, 0);
-        }
+        uchar4 color = png_defilter_pixel(dest, src, prevs, width, height, bpp, x, y, i, filter);
         set_prev(prevs, 0, y, i, color);
         barrier(CLK_LOCAL_MEM_FENCE);
         //printf(\"--- next ---\\n\");
     }
+
+    //for (int i = 0; i < residual_length; i++) {
+    /*if (group_id == 0) {
+        y = start_y + get_local_size(0);
+        for (int j = 0; j < width + 100; j++) {
+            int x = j + x_offset;
+            uchar4 color = png_defilter_pixel(dest,
+                                              src,
+                                              prevs,
+                                              width,
+                                              height,
+                                              bpp,
+                                              x,
+                                              y,
+                                              j,
+                                              filter);
+            set_prev(prevs, 0, y, j, color);
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }*/
 }
 ";
 
@@ -277,48 +316,71 @@ impl Image {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+struct Run {
+    start: u32,
+    length: u32,
+}
+
+impl Run {
+    fn end(&self) -> u32 {
+        self.start + self.length
+    }
+}
+
+#[derive(Copy, Clone)]
+struct Overflow {
+    start: u32,
+    length: u32,
+}
+
 struct Plan {
     scanlines: Vec<(i32, i32)>,
     skews: Vec<i32>,
+    overflows: Vec<Overflow>,
 }
 
 impl Plan {
     fn create(max_workgroup_size: usize, filters: &[u8]) -> Plan {
-        #[derive(Copy, Clone)]
-        struct Run {
-            start: u32,
-            length: u32,
-        }
-
-        let mut runs = vec![];
-        let mut run = Run {
-            start: 0,
-            length: 0,
-        };
-        for (i, filter) in filters.iter().enumerate() {
-            if *filter < 2 {
+        let (mut runs, mut overflows) = (vec![], vec![]);
+        {
+            let mut flush_run = |mut run: Run| {
                 if run.length > 0 {
+                    if (run.length as usize) > max_workgroup_size {
+                        overflows.push(Overflow {
+                            start: run.start + (max_workgroup_size as u32),
+                            length: run.length - (max_workgroup_size as u32),
+                        });
+                        run.length = max_workgroup_size as u32
+                    }
                     runs.push(run);
                 }
-                run = Run {
-                    start: i as u32,
-                    length: 1,
-                };
-                continue
-            }
+            };
 
-            // FIXME(pcwalton): Do something about runs too big to fit in a workgroup.
-            if (run.length as usize) < max_workgroup_size {
+            let mut run = Run {
+                start: 0,
+                length: 0,
+            };
+            for (i, filter) in filters.iter().enumerate() {
+                if *filter < 2 {
+                    flush_run(run);
+                    run = Run {
+                        start: i as u32,
+                        length: 1,
+                    };
+                    continue
+                }
+
                 run.length += 1
             }
+            flush_run(run);
         }
-        runs.push(run);
 
-        runs.sort_by(|a, b| a.length.cmp(&b.length));
         let mut scanlines = Vec::with_capacity(filters.len());
         let mut skews = Vec::with_capacity(filters.len() / max_workgroup_size + 1);
         let mut workgroup_capacity_remaining = max_workgroup_size;
         let mut workgroup_skew = 0;
+        runs.sort_by(|a, b| a.length.cmp(&b.length));
         while !runs.is_empty() {
             let last = *runs.last().unwrap();
             if (last.length as usize) <= workgroup_capacity_remaining {
@@ -342,6 +404,86 @@ impl Plan {
         Plan {
             scanlines: scanlines,
             skews: skews,
+            overflows: overflows,
+        }
+    }
+
+    fn dump(&self, max_workgroup_size: usize) {
+        println!("Plan:");
+        println!("  Scanlines:");
+        for (i, work_unit) in self.scanlines.iter().enumerate() {
+            println!("    {},{}: {} {}",
+                     i / (max_workgroup_size as usize),
+                     i % (max_workgroup_size as usize),
+                     work_unit.0,
+                     work_unit.1);
+        }
+        println!("  Skews:");
+        for (i, skew) in self.skews.iter().enumerate() {
+            println!("    {}: {}", i, skew);
+        }
+        println!("  Overflows:");
+        for (i, overflow) in self.overflows.iter().enumerate() {
+            println!("    {}: {} {}", i, overflow.start, overflow.length);
+        }
+    }
+}
+
+#[inline(never)]
+fn cpu_defilter(data: &mut [u8], width: u32, height: u32, filters: &[u8]) {
+    for y in 1..height {
+        let filter = filters[y as usize];
+        for x in 1..width {
+            let mut color = get(data, width, x, y);
+            let a = get(data, width, x - 1, y);
+            let b = get(data, width, x, y - 1);
+            let c = get(data, width, x - 1, y - 1);
+            color = color + match filter {
+                0 => i16x8::splat(0),
+                1 => a,
+                2 => b,
+                3 => (a + b) >> 2u16,
+                _ => {
+                    let sp = a + b - c;
+                    let sa = sp - a;
+                    let sb = sp - b;
+                    let sc = sp - c;
+                    (sa.le(sb) & sa.le(sc)).select(sa, sb.le(sc).select(sb, sc))
+                }
+            };
+            set(data, width, x, y, color)
+        }
+    }
+
+    fn get(data: &[u8], width: u32, x: u32, y: u32) -> i16x8 {
+        unsafe {
+            let color: u32 = *mem::transmute::<*const u8,*const u32>(
+                &data[((y * width + x) * BPP + 0) as usize] as *const u8);
+            let mut color = u32x4::splat(color);
+            let mask = u8x16::new(0, 0x80,
+                                  1, 0x80,
+                                  2, 0x80,
+                                  3, 0x80,
+                                  0x80, 0x80,
+                                  0x80, 0x80,
+                                  0x80, 0x80,
+                                  0x80, 0x80);
+            asm!("pshufb $0,$1" : "=x"(color) : "0"(color) "x"(mask) : : "intel");
+            mem::transmute::<u32x4, i16x8>(color)
+        }
+    }
+
+    fn set(data: &mut [u8], width: u32, x: u32, y: u32, color: i16x8) {
+        unsafe {
+            let dest: *mut u32 = mem::transmute::<*mut u8,*mut u32>(
+                &mut data[((y * width + x) * BPP + 0) as usize] as *mut u8);
+            let mut color = mem::transmute::<i16x8, u32x4>(color);
+            let mask = u8x16::new(0, 2, 4, 6,
+                                  0x80, 0x80, 0x80, 0x80,
+                                  0x80, 0x80, 0x80, 0x80,
+                                  0x80, 0x80, 0x80, 0x80);
+            asm!("pshufb $0,$1" : "=x"(color) : "0"(color) "x"(mask) : : "intel");
+            *dest = color.extract(0);
         }
     }
 }
@@ -355,9 +497,9 @@ fn defilter(width: u32,
     let (device, context, queue) =
         try!(util::create_compute_context_prefer(cl_type).map_err(|_| ()));
     let filter_buffer: CLBuffer<u8> = context.create_buffer(height as usize, CL_MEM_READ_ONLY);
-    let mut filter_data: Vec<u8> =
+    let mut filters: Vec<u8> =
         (0..height).map(|y| unfiltered_data[(y * ((width * BPP) + 1)) as usize]).collect();
-    queue.write(&filter_buffer, &&filter_data[..], ());
+    queue.write(&filter_buffer, &&filters[..], ());
 
     let mut max_workgroup_size: u64 = 0;
     unsafe {
@@ -370,19 +512,8 @@ fn defilter(width: u32,
         println!("workgroup size={}", max_workgroup_size);
     }
 
-    let plan = Plan::create(max_workgroup_size as usize, &filter_data[..]);
-    println!("Plan:\n  Scanlines:");
-    for (i, work_unit) in plan.scanlines.iter().enumerate() {
-        println!("{},{}: {} {}",
-                 i / (max_workgroup_size as usize),
-                 i % (max_workgroup_size as usize),
-                 work_unit.0,
-                 work_unit.1);
-    }
-    println!("  Skews:");
-    for (i, skew) in plan.skews.iter().enumerate() {
-        println!("{}: {}", i, skew);
-    }
+    let plan = Plan::create(max_workgroup_size as usize, &filters[..]);
+    plan.dump(max_workgroup_size as usize);
 
     let mut errcode = 0;
     let mut format = cl_image_format {
@@ -447,7 +578,6 @@ fn defilter(width: u32,
     let event;
     let mut pixels: Vec<u8>;
     unsafe {
-
         let kernel = program.create_kernel("png_defilter");
         let dest_image_ref = &dest_image as *const _;
         let cl_kernel = *(&kernel as *const Kernel as *const cl_kernel);
@@ -482,8 +612,8 @@ fn defilter(width: u32,
         //event = queue.enqueue_kernel(&kernel, (height / 3 + 25) as isize, None, ());
         event = queue.enqueue_kernel(
             &kernel,
-            plan.scanlines.len(),
-            Some(max_workgroup_size as usize),
+            plan.scanlines.len() as isize,
+            Some(max_workgroup_size as isize),
             ());
         let stuff: Vec<u8> = queue.get(&filter_buffer, &event);
         pixels = iter::repeat(0).take((width * height * BPP) as usize).collect();
@@ -504,6 +634,28 @@ fn defilter(width: u32,
 
     let elapsed = event.end_time() - event.start_time();
     println!("defiltering ({}): {}ms", cl_type_description, (elapsed as f64) / 1_000_000.0);
+
+    let mut cpu_data = vec![];
+    {
+        let mut src_data = &unfiltered_data[1..];
+        for y in 0..height {
+            cpu_data.push_all(&src_data[0..(width * BPP) as usize]);
+            if y < height - 1 {
+                src_data = &src_data[(width * BPP + 1) as usize..]
+            }
+        }
+    }
+
+    let before = time::precise_time_s();
+    unsafe {
+        cpu_defilter(&mut cpu_data[..],
+                     width,
+                     height,
+                     &filters[..])
+    }
+    let elapsed = time::precise_time_s() - before;
+    println!("CPU decode: {}ms", elapsed * 1000.0);
+
     Ok(pixels)
 }
 
