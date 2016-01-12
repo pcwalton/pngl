@@ -59,47 +59,6 @@ void set_color(write_only image2d_t dest, int bpp, int x, int y, uchar4 color) {
     write_imageui(dest, (int2)(x, y), convert_uint4(color));
 }
 
-uchar4 png_none_defilter(write_only image2d_t dest,
-                         read_only image2d_t src,
-                         __local uchar4 *prevs,
-                         int width,
-                         int height,
-                         int bpp,
-                         int x,
-                         int y,
-                         int i,
-                         uchar4 color) {
-    return color;
-}
-
-uchar4 png_left_defilter(write_only image2d_t dest,
-                         read_only image2d_t src,
-                         __local uchar4 *prevs,
-                         int width,
-                         int height,
-                         int bpp,
-                         int x,
-                         int y,
-                         int i,
-                         uchar4 color) {
-    uchar4 a = x > 0 ? get_prev(prevs, 1, y, i) : (uchar4)(0, 0, 0, 0);
-    return a + color;
-}
-
-uchar4 png_up_defilter(write_only image2d_t dest,
-                       read_only image2d_t src,
-                       __local uchar4 *prevs,
-                       int width,
-                       int height,
-                       int bpp,
-                       int x,
-                       int y,
-                       int i,
-                       uchar4 color) {
-    uchar4 b = y > 0 ? get_prev(prevs, 1, y - 1, i) : (uchar4)(0, 0, 0, 0);
-    return b + color;
-}
-
 uchar4 png_avg_defilter(write_only image2d_t dest,
                         read_only image2d_t src,
                         __local uchar4 *prevs,
@@ -109,10 +68,11 @@ uchar4 png_avg_defilter(write_only image2d_t dest,
                         int x,
                         int y,
                         int i,
-                        uchar4 color) {
-    short4 a = x > 0 ? convert_short4(get_prev(prevs, 1, y, i)) : (short4)(0, 0, 0, 0);
-    short4 b = y > 0 ? convert_short4(get_prev(prevs, 1, y - 1, i)) : (short4)(0, 0, 0, 0);
-    return convert_uchar4((a + b) / (short4)(2, 2, 2, 2)) + color;
+                        uchar4 color,
+                        uchar4 a,
+                        uchar4 b,
+                        uchar4 c) {
+    return convert_uchar4((convert_short4(a) + convert_short4(b)) / (short4)(2, 2, 2, 2)) + color;
 }
 
 uchar4 png_paeth_defilter(write_only image2d_t dest,
@@ -124,10 +84,10 @@ uchar4 png_paeth_defilter(write_only image2d_t dest,
                           int x,
                           int y,
                           int i,
-                          uchar4 color) {
-    uchar4 a = x > 0 ? get_prev(prevs, 1, y, i) : (uchar4)(0, 0, 0, 0);
-    uchar4 b = y > 0 ? get_prev(prevs, 1, y - 1, i) : (uchar4)(0, 0, 0, 0);
-    uchar4 c = (x > 0 && y > 0) ? get_prev(prevs, 2, y - 1, i) : (uchar4)(0, 0, 0, 0);
+                          uchar4 color,
+                          uchar4 a,
+                          uchar4 b,
+                          uchar4 c) {
     short4 sa = convert_short4(a);
     short4 sb = convert_short4(b);
     short4 sc = convert_short4(c);
@@ -142,36 +102,40 @@ uchar4 png_paeth_defilter(write_only image2d_t dest,
 
 __kernel void png_defilter(write_only image2d_t dest,
                            read_only image2d_t src,
+                           __global int2 *scanlines,
+                           __global int *skews,
                            __global uchar *filters,
                            __local uchar4 *prevs,
                            int width,
                            int height) {
     int bpp = 4;
-    int y = get_global_id(0);
+    int index = get_global_id(0);
+    int x_offset = scanlines[index][0];
+    int y = scanlines[index][1];
+    int skew = skews[get_group_id(0)];
     uchar filter = filters[y];
 
-    for (int i = 0; i < width + 400; i++) {
-        for (int j = 0; j < 2; j++) {
-            int x = i - y;
-            uchar4 color;
-            if (y < height && x >= 0 && x < width) {
-                color = get_src_color(src, bpp, x, y);
-                if (filter == 0)
-                    color = png_none_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-                else if (filter == 1)
-                    color = png_left_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-                else if (filter == 2)
-                    color = png_up_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-                else if (filter == 3)
-                    color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-                else if (filter == 4)
-                    color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color);
-                set_color(dest, bpp, x, y, color);
-            } else {
-                color = (uchar4)(0, 0, 0, 0);
-            }
-            set_prev(prevs, 0, y, i, color);
+    for (int i = 0; i < width + skew; i++) {
+        int x = i + x_offset;
+        uchar4 color;
+        if (y < height && x >= 0 && x < width) {
+            color = get_src_color(src, bpp, x, y);
+            uchar4 a = get_prev(prevs, 1, y, i);
+            uchar4 b = get_prev(prevs, 1, y - 1, i);
+            uchar4 c = get_prev(prevs, 2, y - 1, i);
+            if (filter == 1)
+                color = a + color;
+            else if (filter == 2)
+                color = b + color;
+            else if (filter == 3)
+                color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
+            else if (filter == 4)
+                color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
+            set_color(dest, bpp, x, y, color);
+        } else {
+            color = (uchar4)(0, 0, 0, 0);
         }
+        set_prev(prevs, 0, y, i, color);
         barrier(CLK_LOCAL_MEM_FENCE);
         //printf(\"--- next ---\\n\");
     }
@@ -313,6 +277,75 @@ impl Image {
     }
 }
 
+struct Plan {
+    scanlines: Vec<(i32, i32)>,
+    skews: Vec<i32>,
+}
+
+impl Plan {
+    fn create(max_workgroup_size: usize, filters: &[u8]) -> Plan {
+        #[derive(Copy, Clone)]
+        struct Run {
+            start: u32,
+            length: u32,
+        }
+
+        let mut runs = vec![];
+        let mut run = Run {
+            start: 0,
+            length: 0,
+        };
+        for (i, filter) in filters.iter().enumerate() {
+            if *filter < 2 {
+                if run.length > 0 {
+                    runs.push(run);
+                }
+                run = Run {
+                    start: i as u32,
+                    length: 1,
+                };
+                continue
+            }
+
+            // FIXME(pcwalton): Do something about runs too big to fit in a workgroup.
+            if (run.length as usize) < max_workgroup_size {
+                run.length += 1
+            }
+        }
+        runs.push(run);
+
+        runs.sort_by(|a, b| a.length.cmp(&b.length));
+        let mut scanlines = Vec::with_capacity(filters.len());
+        let mut skews = Vec::with_capacity(filters.len() / max_workgroup_size + 1);
+        let mut workgroup_capacity_remaining = max_workgroup_size;
+        let mut workgroup_skew = 0;
+        while !runs.is_empty() {
+            let last = *runs.last().unwrap();
+            if (last.length as usize) <= workgroup_capacity_remaining {
+                for i in 0..(last.length as i32) {
+                    scanlines.push((-i, (last.start as i32) + i))
+                }
+                workgroup_capacity_remaining -= last.length as usize;
+                workgroup_skew = cmp::max((last.length as i32) - 1, workgroup_skew);
+                runs.pop();
+                continue
+            }
+
+            scanlines.extend(iter::repeat((0, -1)).take(workgroup_capacity_remaining));
+            skews.push(workgroup_skew);
+            workgroup_capacity_remaining = max_workgroup_size;
+            workgroup_skew = 0
+        }
+        scanlines.extend(iter::repeat((0, -1)).take(workgroup_capacity_remaining));
+        skews.push(workgroup_skew);
+
+        Plan {
+            scanlines: scanlines,
+            skews: skews,
+        }
+    }
+}
+
 fn defilter(width: u32,
             height: u32,
             unfiltered_data: &[u8],
@@ -326,23 +359,29 @@ fn defilter(width: u32,
         (0..height).map(|y| unfiltered_data[(y * ((width * BPP) + 1)) as usize]).collect();
     queue.write(&filter_buffer, &&filter_data[..], ());
 
-    let mut plan = vec![];
-    let mut work_unit = (0, 0);
-    for (i, byte) in filter_data[..].iter().enumerate() {
-        if *byte < 2 {
-            plan.push(work_unit);
-            work_unit = (i, 0);
-            continue
-        }
-        work_unit = (work_unit.0, work_unit.1 + 1);
+    let mut max_workgroup_size: u64 = 0;
+    unsafe {
+        let cl_device = *(&device as *const Device as *const cl_device_id);
+        clGetDeviceInfo(cl_device,
+                        CL_DEVICE_MAX_WORK_GROUP_SIZE,
+                        8,
+                        &mut max_workgroup_size as *mut _ as *mut _,
+                        ptr::null_mut());
+        println!("workgroup size={}", max_workgroup_size);
     }
-    plan.push(work_unit);
-    println!("Plan:\nSetup: {}\nWavefront:",
-             plan.iter().filter(|&&(_, count)| count == 0).count());
-    for work_unit in &plan[..] {
-        if work_unit.1 != 0 {
-            println!("{} for {}", work_unit.0, work_unit.1);
-        }
+
+    let plan = Plan::create(max_workgroup_size as usize, &filter_data[..]);
+    println!("Plan:\n  Scanlines:");
+    for (i, work_unit) in plan.scanlines.iter().enumerate() {
+        println!("{},{}: {} {}",
+                 i / (max_workgroup_size as usize),
+                 i % (max_workgroup_size as usize),
+                 work_unit.0,
+                 work_unit.1);
+    }
+    println!("  Skews:");
+    for (i, skew) in plan.skews.iter().enumerate() {
+        println!("{}: {}", i, skew);
     }
 
     let mut errcode = 0;
@@ -390,6 +429,12 @@ fn defilter(width: u32,
     /*let prevs_buffer: CLBuffer<u8> = context.create_buffer((height * BPP * 3) as usize,
                                                            CL_MEM_READ_WRITE);*/
 
+    let scanlines_buffer: CLBuffer<(i32, i32)> = context.create_buffer(plan.scanlines.len(),
+                                                                       CL_MEM_READ_ONLY);
+    queue.write(&scanlines_buffer, &&plan.scanlines[..], ());
+    let skews_buffer: CLBuffer<i32> = context.create_buffer(plan.skews.len(), CL_MEM_READ_ONLY);
+    queue.write(&skews_buffer, &&plan.skews[..], ());
+
     let program = context.create_program_from_source(KERNEL_SOURCE);
     match program.build(&device) {
         Ok(_) => {}
@@ -402,14 +447,6 @@ fn defilter(width: u32,
     let event;
     let mut pixels: Vec<u8>;
     unsafe {
-        let mut max_workgroup_size: u64 = 0;
-        let cl_device = *(&device as *const Device as *const cl_device_id);
-        clGetDeviceInfo(cl_device,
-                        CL_DEVICE_MAX_WORK_GROUP_SIZE,
-                        8,
-                        &mut max_workgroup_size as *mut _ as *mut _,
-                        ptr::null_mut());
-        println!("workgroup size={}", max_workgroup_size);
 
         let kernel = program.create_kernel("png_defilter");
         let dest_image_ref = &dest_image as *const _;
@@ -423,13 +460,15 @@ fn defilter(width: u32,
                                1,
                                mem::size_of::<cl_mem>() as u64,
                                src_image_ref as *const _) == CLStatus::CL_SUCCESS as i32);
-        kernel.set_arg(2, &filter_buffer);
+        kernel.set_arg(2, &scanlines_buffer);
+        kernel.set_arg(3, &skews_buffer);
+        kernel.set_arg(4, &filter_buffer);
         assert!(clSetKernelArg(cl_kernel,
-                               3,
+                               5,
                                max_workgroup_size * 4,
                                ptr::null()) == CLStatus::CL_SUCCESS as i32);
-        kernel.set_arg(4, &width);
-        kernel.set_arg(5, &height);
+        kernel.set_arg(6, &width);
+        kernel.set_arg(7, &height);
 
         let mut max_work_item_sizes: (u64, u64, u64) = (0, 0, 0);
         let cl_device = *(&device as *const Device as *const cl_device_id);
@@ -443,8 +482,8 @@ fn defilter(width: u32,
         //event = queue.enqueue_kernel(&kernel, (height / 3 + 25) as isize, None, ());
         event = queue.enqueue_kernel(
             &kernel,
-            max_workgroup_size as isize,
-            Some(max_workgroup_size as isize),
+            plan.scanlines.len(),
+            Some(max_workgroup_size as usize),
             ());
         let stuff: Vec<u8> = queue.get(&filter_buffer, &event);
         pixels = iter::repeat(0).take((width * height * BPP) as usize).collect();
