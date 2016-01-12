@@ -5,6 +5,7 @@ version = "0.1.0"
 [dependencies]
 byteorder = "^0.4.2"
 flate2 = "^0.2.11"
+libc = "0.2"
 time = "^0.1"
 
 [dependencies.opencl]
