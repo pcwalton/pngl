@@ -12,7 +12,7 @@ use flate2::{Decompress, Flush, Status};
 use libc::size_t;
 use opencl::cl::ll::{clCreateImage2D, clEnqueueReadImage, clEnqueueWriteImage, clGetDeviceInfo};
 use opencl::cl::ll::{clSetKernelArg};
-use opencl::cl::{CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_DEVICE_MAX_WORK_ITEM_SIZES, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
+use opencl::cl::{CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_DEVICE_MAX_WORK_ITEM_SIZES, CL_FALSE, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl::cl::{CL_RGBA, CL_TRUE, CL_UNSIGNED_INT8, CLStatus};
 use opencl::cl::{cl_channel_order, cl_channel_type, cl_device_id, cl_kernel, cl_mem};
 use opencl::hl::{Device, Event, EventList, Kernel};
@@ -27,6 +27,7 @@ use std::ptr;
 
 const BPP: u32 = 4;
 const BUFFER_SIZE: usize = 4096;
+const MIN_WORKGROUP_SIZE: usize = 128;
 
 static MAGIC: [u8; 8] = [137, 80, 78, 71, 13, 10, 26, 10];
 static IDAT: [u8; 4] = [b'I', b'D', b'A', b'T'];
@@ -393,35 +394,67 @@ impl Plan {
 }
 
 #[inline(never)]
-fn cpu_defilter(data: &mut [u8], width: u32, height: u32, filters: &[u8]) {
-    for y in 1..height {
+fn cpu_defilter(data: &mut [u8], width: u32, height: u32, filters: &[u8], skip_first: bool) {
+    /*let mut first_row = Vec::new();
+    for byte in data[0..((width * BPP) as usize)].iter() {
+        first_row.push(*byte);
+    }*/
+
+    let first = if skip_first {
+        1
+    } else {
+        0
+    };
+    for y in first..height {
+        /*for (i, byte) in first_row.iter().enumerate() {
+            data[((y * width * BPP) as usize) + i] = *byte;
+        }*/
         let filter = filters[y as usize];
-        for x in 1..width {
-            let mut color = get(data, width, x, y);
-            let a = get(data, width, x - 1, y);
-            let b = get(data, width, x, y - 1);
-            let c = get(data, width, x - 1, y - 1);
+        for x in 0..width {
+            let mut color = get_the_pixel(data, width, x, y);
+            let a = if x == 0 {
+                i16x8::splat(0)
+            } else {
+                get_the_pixel(data, width, x - 1, y)
+            };
+            let b = if y == 0 {
+                i16x8::splat(0)
+            } else {
+                get_the_pixel(data, width, x, y - 1)
+            };
+            let c = if x == 0 || y == 0 {
+                i16x8::splat(0)
+            } else {
+                get_the_pixel(data, width, x - 1, y - 1)
+            };
             color = color + match filter {
                 0 => i16x8::splat(0),
                 1 => a,
                 2 => b,
-                3 => (a + b) >> 2u16,
+                3 => (a + b) >> 1u16,
                 _ => {
-                    let sp = a + b - c;
-                    let sa = sp - a;
-                    let sb = sp - b;
-                    let sc = sp - c;
-                    (sa.le(sb) & sa.le(sc)).select(sa, sb.le(sc).select(sb, sc))
+                    let p = a + b - c;
+                    let pa = pabsw(p - a);
+                    let pb = pabsw(p - b);
+                    let pc = pabsw(p - c);
+                    (pa.le(pb) & pa.le(pc)).select(a, pb.le(pc).select(b, c))
                 }
             };
-            set(data, width, x, y, color)
+            set_the_pixel(data, width, x, y, color)
         }
     }
 
-    fn get(data: &[u8], width: u32, x: u32, y: u32) -> i16x8 {
+    fn pabsw(mut x: i16x8) -> i16x8 {
+        unsafe {
+            asm!("pabsw $0,$0" : "+x"(x) : : : "intel");
+        }
+        x
+    }
+
+    fn get_the_pixel(data: &[u8], width: u32, x: u32, y: u32) -> i16x8 {
         unsafe {
             let color: u32 = *mem::transmute::<*const u8,*const u32>(
-                &data[((y * width + x) * BPP + 0) as usize] as *const u8);
+                &data[((y * width + x) * BPP) as usize] as *const u8);
             let mut color = u32x4::splat(color);
             let mask = u8x16::new(0, 0x80,
                                   1, 0x80,
@@ -431,12 +464,12 @@ fn cpu_defilter(data: &mut [u8], width: u32, height: u32, filters: &[u8]) {
                                   0x80, 0x80,
                                   0x80, 0x80,
                                   0x80, 0x80);
-            asm!("pshufb $0,$1" : "=x"(color) : "0"(color) "x"(mask) : : "intel");
+            asm!("pshufb $0,$1" : "+x"(color) : "x"(mask) : : "intel");
             mem::transmute::<u32x4, i16x8>(color)
         }
     }
 
-    fn set(data: &mut [u8], width: u32, x: u32, y: u32, color: i16x8) {
+    fn set_the_pixel(data: &mut [u8], width: u32, x: u32, y: u32, color: i16x8) {
         unsafe {
             let dest: *mut u32 = mem::transmute::<*mut u8,*mut u32>(
                 &mut data[((y * width + x) * BPP + 0) as usize] as *mut u8);
@@ -445,7 +478,7 @@ fn cpu_defilter(data: &mut [u8], width: u32, height: u32, filters: &[u8]) {
                                   0x80, 0x80, 0x80, 0x80,
                                   0x80, 0x80, 0x80, 0x80,
                                   0x80, 0x80, 0x80, 0x80);
-            asm!("pshufb $0,$1" : "=x"(color) : "0"(color) "x"(mask) : : "intel");
+            asm!("pshufb $0,$1" : "+x"(color) : "x"(mask) : : "intel");
             *dest = color.extract(0);
         }
     }
@@ -508,7 +541,7 @@ fn defilter(width: u32,
 
         errcode = clEnqueueWriteImage(queue.cqueue,
                                       src_image,
-                                      CL_TRUE,
+                                      CL_FALSE,
                                       [0, 0, 0].as_mut_ptr(),
                                       [width as u64, height as u64, 1].as_mut_ptr(),
                                       (width * BPP + 1) as u64,
@@ -535,6 +568,17 @@ fn defilter(width: u32,
         Err(log) => {
             println!("{}", log);
             return Err(())
+        }
+    }
+
+    let mut cpu_data = vec![];
+    {
+        let mut src_data = &unfiltered_data[1..];
+        for y in 0..height {
+            cpu_data.push_all(&src_data[0..(width * BPP) as usize]);
+            if y < height - 1 {
+                src_data = &src_data[(width * BPP + 1) as usize..]
+            }
         }
     }
 
@@ -572,23 +616,16 @@ fn defilter(width: u32,
                         ptr::null_mut());
         println!("work item sizes={:?}", max_work_item_sizes);
 
-        //event = queue.enqueue_kernel(&kernel, (height / 3 + 25) as isize, None, ());
+        let workgroup_size = cmp::min(cmp::max(plan.skews.iter().cloned().max().unwrap_or(1),
+                                               MIN_WORKGROUP_SIZE as i32) as u64,
+                                      max_workgroup_size).next_power_of_two();
+        println!("selected workgroup size: {}", workgroup_size);
+
         kernel_event = queue.enqueue_async_kernel(
             &kernel,
             plan.scanlines.len() as isize,
-            Some(max_workgroup_size as isize),
+            Some(workgroup_size as isize),
             ());
-    }
-
-    let mut cpu_data = vec![];
-    {
-        let mut src_data = &unfiltered_data[1..];
-        for y in 0..height {
-            cpu_data.push_all(&src_data[0..(width * BPP) as usize]);
-            if y < height - 1 {
-                src_data = &src_data[(width * BPP + 1) as usize..]
-            }
-        }
     }
 
     let mut overflow_readback_events = vec![];
@@ -600,7 +637,7 @@ fn defilter(width: u32,
         unsafe {
             errcode = clEnqueueReadImage(queue.cqueue,
                                          dest_image,
-                                         CL_TRUE,
+                                         CL_FALSE,
                                          [0, (overflow.start - 1) as u64, 0].as_mut_ptr(),
                                          [width as u64, 1, 1].as_mut_ptr(),
                                          (width * BPP) as u64,
@@ -620,14 +657,15 @@ fn defilter(width: u32,
     let mut overflow_upload_events = vec![];
     for (i, overflow) in plan.overflows.iter().enumerate() {
         overflow_readback_events[i].wait();
-        
+
         let before = time::precise_time_s();
-        let byte_start = (overflow.start * width * BPP) as usize;
-        let byte_length = (overflow.length * width * BPP) as usize;
+        let byte_start = ((overflow.start - 1) * width * BPP) as usize;
+        let byte_length = ((overflow.length + 1) * width * BPP) as usize;
         cpu_defilter(&mut cpu_data[byte_start..(byte_start + byte_length)],
                      width,
-                     overflow.length,
-                     &filters[..]);
+                     overflow.length + 1,
+                     &filters[((overflow.start - 1) as usize)..],
+                     true);
         let elapsed = time::precise_time_s() - before;
         accelerated_execute_time += elapsed * 1000.0;
         println!("CPU overflow defiltering: {}ms", elapsed * 1000.0);
@@ -637,7 +675,7 @@ fn defilter(width: u32,
             errcode = clEnqueueWriteImage(
                 queue.cqueue,
                 dest_image,
-                CL_TRUE,
+                CL_FALSE,
                 [0, overflow.start as u64, 0].as_mut_ptr(),
                 [width as u64, overflow.length as u64, 1].as_mut_ptr(),
                 (width * BPP) as u64,
@@ -654,7 +692,9 @@ fn defilter(width: u32,
     }
 
     kernel_event.wait();
-    (&overflow_upload_events[..]).wait();
+    if !overflow_upload_events.is_empty() {
+        (&overflow_upload_events[..]).wait();
+    }
 
     accelerated_execute_time += event_elapsed_time(&kernel_event);
     println!("GPU defiltering ({}): {}ms", cl_type_description, event_elapsed_time(&kernel_event));
@@ -675,7 +715,7 @@ fn defilter(width: u32,
     println!("GPU-accelerated wallclock time: {}ms", ns_to_ms(elapsed_total_time));
 
     let cpu_before = time::precise_time_s();
-    cpu_defilter(&mut cpu_data[..], width, height, &filters[..]);
+    cpu_defilter(&mut cpu_data[..], width, height, &filters[..], false);
     let cpu_elapsed = (time::precise_time_s() - cpu_before) * 1000.0;
     println!("CPU decode: {}ms", cpu_elapsed);
 
