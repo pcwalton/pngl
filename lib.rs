@@ -15,7 +15,7 @@ use opencl::cl::ll::{clSetKernelArg};
 use opencl::cl::{CL_DEVICE_MAX_WORK_GROUP_SIZE, CL_DEVICE_MAX_WORK_ITEM_SIZES, CL_MEM_COPY_HOST_PTR, CL_MEM_READ_ONLY, CL_MEM_READ_WRITE, CL_MEM_WRITE_ONLY};
 use opencl::cl::{CL_RGBA, CL_TRUE, CL_UNSIGNED_INT8, CLStatus};
 use opencl::cl::{cl_channel_order, cl_channel_type, cl_device_id, cl_kernel, cl_mem};
-use opencl::hl::{Device, Kernel};
+use opencl::hl::{Device, Event, EventList, Kernel};
 use opencl::mem::CLBuffer;
 use opencl::util::{self, PreferedType};
 use simd::{i16x8, u32x4, u8x16};
@@ -35,29 +35,21 @@ static IEND: [u8; 4] = [b'I', b'E', b'N', b'D'];
 static KERNEL_SOURCE: &'static str = "
 const sampler_t sampler = CLK_NORMALIZED_COORDS_FALSE | CLK_ADDRESS_CLAMP | CLK_FILTER_NEAREST;
 
-int imod(int a, int b) {
-    int r = a % b;
-    return r < 0 ? r + b : r;
-    //return abs(r);
-}
-
 uchar4 get_prev(__local uchar4 *prevs, int x, int y, int i) {
-    int index = y * 3 + imod(i - x, 3);
+    int index = y * 3 + (i - x) % 3;
     return prevs[index];
 }
 
-uchar4 get_src_color(read_only image2d_t src, int bpp, int x, int y) {
+uchar4 get_src_color(read_only image2d_t src, int x, int y) {
     return convert_uchar4(read_imageui(src, sampler, (int2)(x, y)));
 }
 
 void set_prev(__local uchar4 *prevs, int x, int y, int i, uchar4 color) {
-    //prevs[y * 3 + imod(i - x, 3)] = color;
-    int index = y * 3 + imod(i - x, 3);
-    //printf(\"%d writes to %d:%d\\n\", get_global_id(0), y, index);
+    int index = y * 3 + (i - x) % 3;
     prevs[index] = color;
 }
 
-void set_color(write_only image2d_t dest, int bpp, int x, int y, uchar4 color) {
+void set_color(write_only image2d_t dest, int x, int y, uchar4 color) {
     write_imageui(dest, (int2)(x, y), convert_uint4(color));
 }
 
@@ -66,14 +58,12 @@ uchar4 png_avg_defilter(write_only image2d_t dest,
                         __local uchar4 *prevs,
                         int width,
                         int height,
-                        int bpp,
                         int x,
                         int y,
                         int i,
                         uchar4 color,
                         uchar4 a,
-                        uchar4 b,
-                        uchar4 c) {
+                        uchar4 b) {
     return convert_uchar4((convert_short4(a) + convert_short4(b)) / (short4)(2, 2, 2, 2)) + color;
 }
 
@@ -82,7 +72,6 @@ uchar4 png_paeth_defilter(write_only image2d_t dest,
                           __local uchar4 *prevs,
                           int width,
                           int height,
-                          int bpp,
                           int x,
                           int y,
                           int i,
@@ -107,7 +96,6 @@ uchar4 png_defilter_pixel(write_only image2d_t dest,
                           __local uchar4 *prevs,
                           int width,
                           int height,
-                          int bpp,
                           int x,
                           int y,
                           int i,
@@ -115,7 +103,7 @@ uchar4 png_defilter_pixel(write_only image2d_t dest,
     if (y >= height || x < 0 || x >= width)
         return (uchar4)(0, 0, 0, 0);
 
-    uchar4 color = get_src_color(src, bpp, x, y);
+    uchar4 color = get_src_color(src, x, y);
     uchar4 a = get_prev(prevs, 1, y, i);
     uchar4 b = get_prev(prevs, 1, y - 1, i);
     uchar4 c = get_prev(prevs, 2, y - 1, i);
@@ -124,10 +112,10 @@ uchar4 png_defilter_pixel(write_only image2d_t dest,
     else if (filter == 2)
         color = b + color;
     else if (filter == 3)
-        color = png_avg_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
+        color = png_avg_defilter(dest, src, prevs, width, height, x, y, i, color, a, b);
     else if (filter == 4)
-        color = png_paeth_defilter(dest, src, prevs, width, height, bpp, x, y, i, color, a, b, c);
-    set_color(dest, bpp, x, y, color);
+        color = png_paeth_defilter(dest, src, prevs, width, height, x, y, i, color, a, b, c);
+    set_color(dest, x, y, color);
     return color;
 }
 
@@ -135,49 +123,24 @@ __kernel void png_defilter(write_only image2d_t dest,
                            read_only image2d_t src,
                            __global int2 *scanlines,
                            __global int *skews,
-                           /*__global int2 *residuals,*/
                            __global uchar *filters,
                            __local uchar4 *prevs,
                            int width,
                            int height) {
-    int bpp = 4;
     int index = get_global_id(0);
     int group_id = get_group_id(0);
     int x_offset = scanlines[index][0];
     int start_y = scanlines[index][1];
     int y = start_y;
     int skew = skews[group_id];
-    /*int residual_start = residuals[group_id][0];
-    int residual_length = residuals[group_id][1];*/
     uchar filter = filters[y];
 
     for (int i = 0; i < width + skew; i++) {
         int x = i + x_offset;
-        uchar4 color = png_defilter_pixel(dest, src, prevs, width, height, bpp, x, y, i, filter);
+        uchar4 color = png_defilter_pixel(dest, src, prevs, width, height, x, y, i, filter);
         set_prev(prevs, 0, y, i, color);
         barrier(CLK_LOCAL_MEM_FENCE);
-        //printf(\"--- next ---\\n\");
     }
-
-    //for (int i = 0; i < residual_length; i++) {
-    /*if (group_id == 0) {
-        y = start_y + get_local_size(0);
-        for (int j = 0; j < width + 100; j++) {
-            int x = j + x_offset;
-            uchar4 color = png_defilter_pixel(dest,
-                                              src,
-                                              prevs,
-                                              width,
-                                              height,
-                                              bpp,
-                                              x,
-                                              y,
-                                              j,
-                                              filter);
-            set_prev(prevs, 0, y, j, color);
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-    }*/
 }
 ";
 
@@ -575,7 +538,7 @@ fn defilter(width: u32,
         }
     }
 
-    let event;
+    let kernel_event;
     let mut pixels: Vec<u8>;
     unsafe {
         let kernel = program.create_kernel("png_defilter");
@@ -610,30 +573,12 @@ fn defilter(width: u32,
         println!("work item sizes={:?}", max_work_item_sizes);
 
         //event = queue.enqueue_kernel(&kernel, (height / 3 + 25) as isize, None, ());
-        event = queue.enqueue_kernel(
+        kernel_event = queue.enqueue_async_kernel(
             &kernel,
             plan.scanlines.len() as isize,
             Some(max_workgroup_size as isize),
             ());
-        let stuff: Vec<u8> = queue.get(&filter_buffer, &event);
-        pixels = iter::repeat(0).take((width * height * BPP) as usize).collect();
-        let err = clEnqueueReadImage(queue.cqueue,
-                                     dest_image,
-                                     CL_TRUE,
-                                     [0u64, 0u64, 0u64].as_mut_ptr(),
-                                     [width as u64, height as u64, 1].as_mut_ptr(),
-                                     (width * BPP) as u64,
-                                     0,
-                                     pixels.as_mut_ptr() as *mut _,
-                                     1,
-                                     &event.event,
-                                     ptr::null_mut());
-        println!("err={}", err);
-        assert!(err == CLStatus::CL_SUCCESS as i32);
     }
-
-    let elapsed = event.end_time() - event.start_time();
-    println!("defiltering ({}): {}ms", cl_type_description, (elapsed as f64) / 1_000_000.0);
 
     let mut cpu_data = vec![];
     {
@@ -646,15 +591,108 @@ fn defilter(width: u32,
         }
     }
 
-    let before = time::precise_time_s();
-    unsafe {
-        cpu_defilter(&mut cpu_data[..],
-                     width,
-                     height,
-                     &filters[..])
+    let mut overflow_readback_events = vec![];
+    for overflow in &plan.overflows {
+        assert!(overflow.start > 0);
+        let byte_start = ((overflow.start - 1) * width * BPP) as usize;
+        let byte_length = (width * BPP) as usize;
+        let mut overflow_readback_event = ptr::null_mut();
+        unsafe {
+            errcode = clEnqueueReadImage(queue.cqueue,
+                                         dest_image,
+                                         CL_TRUE,
+                                         [0, (overflow.start - 1) as u64, 0].as_mut_ptr(),
+                                         [width as u64, 1, 1].as_mut_ptr(),
+                                         (width * BPP) as u64,
+                                         0,
+                                         (&mut cpu_data[byte_start..]).as_mut_ptr() as *mut _,
+                                         1,
+                                         &kernel_event.event,
+                                         &mut overflow_readback_event);
+            assert!(errcode == CLStatus::CL_SUCCESS as i32);
+        }
+        overflow_readback_events.push(Event {
+            event: overflow_readback_event,
+        });
     }
+
+    let mut overflow_upload_events = vec![];
+    for (i, overflow) in plan.overflows.iter().enumerate() {
+        overflow_readback_events[i].wait();
+        
+        let before = time::precise_time_s();
+        let byte_start = (overflow.start * width * BPP) as usize;
+        let byte_length = (overflow.length * width * BPP) as usize;
+        cpu_defilter(&mut cpu_data[byte_start..(byte_start + byte_length)],
+                     width,
+                     overflow.length,
+                     &filters[..]);
+        let elapsed = time::precise_time_s() - before;
+        println!("CPU overflow defiltering: {}ms", elapsed * 1000.0);
+
+        let mut overflow_upload_event = ptr::null_mut();
+        unsafe {
+            errcode = clEnqueueWriteImage(
+                queue.cqueue,
+                dest_image,
+                CL_TRUE,
+                [0, overflow.start as u64, 0].as_mut_ptr(),
+                [width as u64, overflow.length as u64, 1].as_mut_ptr(),
+                (width * BPP) as u64,
+                0,
+                (&mut cpu_data[byte_start..]).as_mut_ptr() as *mut _,
+                0,
+                ptr::null(),
+                &mut overflow_upload_event);
+            assert!(errcode == CLStatus::CL_SUCCESS as i32);
+            overflow_upload_events.push(Event {
+                event: overflow_upload_event,
+            });
+        }
+    }
+
+    kernel_event.wait();
+    (&overflow_upload_events[..]).wait();
+
+    let mut execute_time = event_elapsed_time(&kernel_event);
+    println!("GPU defiltering ({}): {}ms", cl_type_description, event_elapsed_time(&kernel_event));
+    for event in &overflow_readback_events {
+        execute_time += event_elapsed_time(&event);
+        println!("CPU overflow readback: {}ms", event_elapsed_time(&event))
+    }
+    for event in &overflow_upload_events {
+        execute_time += event_elapsed_time(&event);
+        println!("CPU overflow upload: {}ms", event_elapsed_time(&event))
+    }
+    println!("GPU-accelerated execution time: {}ms", execute_time);
+
+    let elapsed_total_time = match overflow_upload_events.last() {
+        Some(last_overflow_upload_event) => last_overflow_upload_event.end_time(),
+        None => kernel_event.end_time(),
+    } - kernel_event.start_time();
+    println!("GPU-accelerated wallclock time: {}ms", ns_to_ms(elapsed_total_time));
+
+    let before = time::precise_time_s();
+    cpu_defilter(&mut cpu_data[..], width, height, &filters[..]);
     let elapsed = time::precise_time_s() - before;
     println!("CPU decode: {}ms", elapsed * 1000.0);
+
+    unsafe {
+        let stuff: Vec<u8> = queue.get(&filter_buffer, &kernel_event);
+        pixels = iter::repeat(0).take((width * height * BPP) as usize).collect();
+        let err = clEnqueueReadImage(queue.cqueue,
+                                     dest_image,
+                                     CL_TRUE,
+                                     [0u64, 0u64, 0u64].as_mut_ptr(),
+                                     [width as u64, height as u64, 1].as_mut_ptr(),
+                                     (width * BPP) as u64,
+                                     0,
+                                     pixels.as_mut_ptr() as *mut _,
+                                     0,
+                                     ptr::null(),
+                                     ptr::null_mut());
+        assert!(err == CLStatus::CL_SUCCESS as i32);
+    }
 
     Ok(pixels)
 }
@@ -663,5 +701,13 @@ fn defilter(width: u32,
 struct cl_image_format {
     image_channel_order: cl_channel_order,
     image_channel_data_type: cl_channel_type,
+}
+
+fn event_elapsed_time(event: &Event) -> f64 {
+    ns_to_ms(event.end_time() - event.start_time())
+}
+
+fn ns_to_ms(ns: u64) -> f64 {
+    (ns as f64) / 1_000_000.0
 }
 
