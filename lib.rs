@@ -616,6 +616,7 @@ fn defilter(width: u32,
         });
     }
 
+    let mut accelerated_execute_time = 0.0;
     let mut overflow_upload_events = vec![];
     for (i, overflow) in plan.overflows.iter().enumerate() {
         overflow_readback_events[i].wait();
@@ -628,6 +629,7 @@ fn defilter(width: u32,
                      overflow.length,
                      &filters[..]);
         let elapsed = time::precise_time_s() - before;
+        accelerated_execute_time += elapsed * 1000.0;
         println!("CPU overflow defiltering: {}ms", elapsed * 1000.0);
 
         let mut overflow_upload_event = ptr::null_mut();
@@ -654,17 +656,17 @@ fn defilter(width: u32,
     kernel_event.wait();
     (&overflow_upload_events[..]).wait();
 
-    let mut execute_time = event_elapsed_time(&kernel_event);
+    accelerated_execute_time += event_elapsed_time(&kernel_event);
     println!("GPU defiltering ({}): {}ms", cl_type_description, event_elapsed_time(&kernel_event));
     for event in &overflow_readback_events {
-        execute_time += event_elapsed_time(&event);
+        accelerated_execute_time += event_elapsed_time(&event);
         println!("CPU overflow readback: {}ms", event_elapsed_time(&event))
     }
     for event in &overflow_upload_events {
-        execute_time += event_elapsed_time(&event);
+        accelerated_execute_time += event_elapsed_time(&event);
         println!("CPU overflow upload: {}ms", event_elapsed_time(&event))
     }
-    println!("GPU-accelerated execution time: {}ms", execute_time);
+    println!("GPU-accelerated execution time: {}ms", accelerated_execute_time);
 
     let elapsed_total_time = match overflow_upload_events.last() {
         Some(last_overflow_upload_event) => last_overflow_upload_event.end_time(),
@@ -672,10 +674,12 @@ fn defilter(width: u32,
     } - kernel_event.start_time();
     println!("GPU-accelerated wallclock time: {}ms", ns_to_ms(elapsed_total_time));
 
-    let before = time::precise_time_s();
+    let cpu_before = time::precise_time_s();
     cpu_defilter(&mut cpu_data[..], width, height, &filters[..]);
-    let elapsed = time::precise_time_s() - before;
-    println!("CPU decode: {}ms", elapsed * 1000.0);
+    let cpu_elapsed = (time::precise_time_s() - cpu_before) * 1000.0;
+    println!("CPU decode: {}ms", cpu_elapsed);
+
+    println!("GPU-accelerated speedup: {}x", cpu_elapsed / accelerated_execute_time);
 
     unsafe {
         let stuff: Vec<u8> = queue.get(&filter_buffer, &kernel_event);

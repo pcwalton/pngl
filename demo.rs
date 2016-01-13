@@ -12,7 +12,6 @@ const BPP: u32 = 4;
 pub fn main() {
     let image =
         Image::decode(&mut File::open(env::args().skip(1).next().unwrap()).unwrap()).unwrap();
-    println!("w={} h={} d={}", image.width, image.height, image.data.len());
 
     // Write out the image into TGA format.
     let mut tga = BufWriter::new(File::create(env::args().skip(2).next().unwrap()).unwrap());
